@@ -1,0 +1,26 @@
+name: Refresh 1836 scoreboard
+
+on:
+  # Schedule is turned on after the server token is set and the build is published.
+  # schedule:
+  #   - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Call the protected refresh URL
+        env:
+          SCOREBOARD_REFRESH_TOKEN: ${{ secrets.SCOREBOARD_REFRESH_TOKEN }}
+        run: |
+          test -n "$SCOREBOARD_REFRESH_TOKEN"
+          curl --fail-with-body --silent --show-error --max-time 90 \
+            --request POST \
+            --header "Authorization: Bearer ${SCOREBOARD_REFRESH_TOKEN}" \
+            --header "Accept: application/json" \
+            "https://lagoon-brook-orchid-pearl.grok.me/api/refresh-sales"
