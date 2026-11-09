@@ -2,12 +2,27 @@ name: Refresh 1836 KPI snapshot
 
 on:
   schedule:
-    # 6:05 a.m. America/Chicago. GitHub cron is UTC, so register both
-    # Central Daylight Time (11:05 UTC) and Central Standard Time (12:05 UTC).
-    # The script continues only when the local hour is 06, which keeps the
-    # refresh at 6:05 a.m. Chicago through daylight-saving changes.
-    - cron: "5 11 * * *"
-    - cron: "5 12 * * *"
+    # Monday-only KPI refresh, America/Chicago. GitHub cron is UTC and does not
+    # follow US daylight-saving time, so each local time is registered twice:
+    # Central Daylight Time (UTC-5) and Central Standard Time (UTC-6).
+    # refresh_call.py keeps the run only when this cron's Chicago clock time is
+    # one of Mon-00:15, Mon-04:15, Mon-05:00 and the job starts within ±40
+    # minutes. The other registration exits 0 without calling the app.
+    # 12:15 a.m. Chicago is still Monday in UTC under both offsets.
+    #
+    # 12:15 a.m. Monday — La Viva can be final after midnight.
+    #   CDT 05:15 UTC Monday, CST 06:15 UTC Monday.
+    - cron: "15 5 * * 1"
+    - cron: "15 6 * * 1"
+    # 4:15 a.m. Monday — two Zalat stores close around 3 a.m., so Zalat sales
+    # and labor are final only after 4 a.m.
+    #   CDT 09:15 UTC Monday, CST 10:15 UTC Monday.
+    - cron: "15 9 * * 1"
+    - cron: "15 10 * * 1"
+    # 5:00 a.m. Monday — final refresh. Everything must be up by 5 a.m.
+    #   CDT 10:00 UTC Monday, CST 11:00 UTC Monday.
+    - cron: "0 10 * * 1"
+    - cron: "0 11 * * 1"
   workflow_dispatch:
     inputs:
       kpi_path:
@@ -39,6 +54,7 @@ jobs:
           SCOREBOARD_REFRESH_TOKEN: ${{ secrets.SCOREBOARD_REFRESH_TOKEN }}
           KPI_PATH_INPUT: ${{ github.event.inputs.kpi_path }}
           KPI_PATH_VAR: ${{ vars.KPI_REFRESH_PATH }}
+          KPI_SCHEDULE: ${{ github.event.schedule }}
         run: |
           set -euo pipefail
           python3 scripts/refresh_call.py \
@@ -52,4 +68,6 @@ jobs:
             --max-attempts 3 \
             --backoff-seconds 10,30 \
             --event "${GITHUB_EVENT_NAME}" \
-            --require-chicago-hour 6
+            --require-chicago-slots Mon-00:15,Mon-04:15,Mon-05:00 \
+            --chicago-slot-tolerance-minutes 40 \
+            --schedule "${KPI_SCHEDULE:-}"

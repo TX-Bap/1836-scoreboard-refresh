@@ -8,8 +8,10 @@ Sales success is HTTP 200, a JSON content type, and a boolean ok value of true.
 An HTML document with HTTP 200 is a failure and is not retried. Network errors,
 timeouts, and HTTP 408, 429, 500, 502, 503, and 504 are retried with backoff.
 The KPI profile adds the snapshot fields documented in the repository README.
-An empty KPI path skips the run so the daily schedule can stay on before the
-app endpoint exists.
+An empty KPI path skips the run so the Monday schedule can stay on before the
+app endpoint exists. Scheduled runs can be limited to a Chicago hour, or to
+weekday and minute slots, so a daylight-saving pair of crons does not both
+call the app. workflow_dispatch ignores that guard.
 """
 
 from __future__ import annotations
@@ -24,7 +26,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Optional, Sequence
 from urllib.parse import urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
@@ -36,6 +38,9 @@ TRANSIENT_STATUSES = frozenset({408, 429, 500, 502, 503, 504})
 REDIRECT_STATUSES = frozenset({301, 302, 303, 307, 308})
 USER_AGENT = "1836-scoreboard-refresh/1.0"
 CHICAGO = ZoneInfo("America/Chicago")
+DEFAULT_SLOT_TOLERANCE_MINUTES = 40
+_WEEKDAY_LABELS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+_WEEKDAY_INDEX = {label.lower(): index for index, label in enumerate(_WEEKDAY_LABELS)}
 MAX_BODY_BYTES = 1_000_000
 EXCERPT_CHARS = 400
 PATH_RE = re.compile(r"^/[A-Za-z0-9._~/-]{1,200}$")
@@ -83,6 +88,29 @@ class Outcome:
     attempts: int = 0
 
 
+@dataclass(frozen=True)
+class ChicagoSlot:
+    """America/Chicago weekday and clock time. weekday uses datetime.weekday() (Monday is 0)."""
+
+    weekday: int
+    hour: int
+    minute: int
+
+    def label(self) -> str:
+        return f"{_WEEKDAY_LABELS[self.weekday]}-{self.hour:02d}:{self.minute:02d}"
+
+
+@dataclass(frozen=True)
+class CronSchedule:
+    """Five-field cron. dow uses GitHub numbering: Sunday is 0, Monday is 1. None means *."""
+
+    minute: int
+    hour: int
+    dom: Optional[int]
+    month: Optional[int]
+    dow: Optional[int]
+
+
 @dataclass
 class Config:
     profile: str
@@ -95,6 +123,9 @@ class Config:
     backoff: tuple[float, ...]
     event: str
     require_chicago_hour: Optional[int] = None
+    require_chicago_slots: tuple[ChicagoSlot, ...] = ()
+    chicago_slot_tolerance_minutes: int = DEFAULT_SLOT_TOLERANCE_MINUTES
+    schedule: str = ""
     now: Optional[datetime] = None
 
 
@@ -388,6 +419,208 @@ def chicago_now(now: Optional[datetime]) -> datetime:
     return now.astimezone(CHICAGO)
 
 
+def parse_chicago_slots(text: str) -> tuple[ChicagoSlot, ...]:
+    raw = text.strip()
+    if raw == "":
+        return ()
+    slots: list[ChicagoSlot] = []
+    seen: set[ChicagoSlot] = set()
+    for part in raw.split(","):
+        piece = part.strip()
+        if piece == "":
+            continue
+        shown = piece if len(piece) <= 40 else piece[:40] + "..."
+        match = re.fullmatch(r"([A-Za-z]{3})-(\d{2}):(\d{2})", piece)
+        if match is None:
+            raise RefreshError(
+                f"Chicago slot must look like Mon-00:15: {shown}",
+                retry=False,
+            )
+        weekday = _WEEKDAY_INDEX.get(match.group(1).lower())
+        hour = int(match.group(2))
+        minute = int(match.group(3))
+        if weekday is None or hour > 23 or minute > 59:
+            raise RefreshError(
+                f"Chicago slot is not a real local time: {shown}",
+                retry=False,
+            )
+        slot = ChicagoSlot(weekday, hour, minute)
+        if slot not in seen:
+            seen.add(slot)
+            slots.append(slot)
+    if not slots:
+        raise RefreshError("Chicago slot list is empty", retry=False)
+    if len(slots) > 48:
+        raise RefreshError("at most 48 Chicago slots are allowed", retry=False)
+    return tuple(slots)
+
+
+def _cron_number(field: str, low: int, high: int, name: str) -> int:
+    if not re.fullmatch(r"\d+", field):
+        raise RefreshError(f"schedule {name} must be a number from {low} to {high}", retry=False)
+    value = int(field)
+    if value < low or value > high:
+        raise RefreshError(f"schedule {name} must be a number from {low} to {high}", retry=False)
+    return value
+
+
+def parse_cron_schedule(text: str) -> CronSchedule:
+    fields = text.split()
+    if len(fields) != 5:
+        raise RefreshError(
+            "schedule must be a 5-field cron such as 15 5 * * 1",
+            retry=False,
+        )
+    minute = _cron_number(fields[0], 0, 59, "minute")
+    hour = _cron_number(fields[1], 0, 23, "hour")
+    dom = None if fields[2] == "*" else _cron_number(fields[2], 1, 31, "day of month")
+    month = None if fields[3] == "*" else _cron_number(fields[3], 1, 12, "month")
+    if fields[4] == "*":
+        dow = None
+    else:
+        dow = _cron_number(fields[4], 0, 7, "day of week")
+        if dow == 7:
+            dow = 0
+    return CronSchedule(minute, hour, dom, month, dow)
+
+
+def format_slots(slots: Sequence[ChicagoSlot]) -> str:
+    ordered = sorted(slots, key=lambda slot: (slot.weekday, slot.hour, slot.minute))
+    return ", ".join(slot.label() for slot in ordered)
+
+
+def chicago_stamp(moment: datetime) -> str:
+    return moment.astimezone(CHICAGO).strftime("%Y-%m-%d %H:%M %Z")
+
+
+def elapsed_minutes(delta: timedelta) -> int:
+    seconds = abs(delta.total_seconds())
+    return int((seconds + 59) // 60)
+
+
+def closest_slot(
+    local: datetime, slots: Sequence[ChicagoSlot]
+) -> tuple[Optional[ChicagoSlot], Optional[timedelta]]:
+    local = local.astimezone(CHICAGO)
+    best_slot: Optional[ChicagoSlot] = None
+    best_delta: Optional[timedelta] = None
+    for slot in slots:
+        for offset in (-1, 0, 1):
+            day = local.date() + timedelta(days=offset)
+            if day.weekday() != slot.weekday:
+                continue
+            candidate = datetime(
+                day.year, day.month, day.day, slot.hour, slot.minute, tzinfo=CHICAGO
+            )
+            delta = abs(local - candidate)
+            if best_delta is None or delta < best_delta:
+                best_slot = slot
+                best_delta = delta
+    return best_slot, best_delta
+
+
+def nearest_cron_instant(now: datetime, cron: CronSchedule) -> Optional[datetime]:
+    now_utc = now.astimezone(timezone.utc)
+    best: Optional[datetime] = None
+    best_delta: Optional[timedelta] = None
+    for offset in range(-7, 8):
+        day = now_utc.date() + timedelta(days=offset)
+        if cron.dom is not None and day.day != cron.dom:
+            continue
+        if cron.month is not None and day.month != cron.month:
+            continue
+        instant = datetime(
+            day.year, day.month, day.day, cron.hour, cron.minute, tzinfo=timezone.utc
+        )
+        if cron.dow is not None and (instant.weekday() + 1) % 7 != cron.dow:
+            continue
+        delta = abs(now_utc - instant)
+        if best_delta is None or delta < best_delta:
+            best = instant
+            best_delta = delta
+    return best
+
+
+def schedule_skip_message(
+    *,
+    event: str,
+    now: Optional[datetime],
+    require_chicago_hour: Optional[int],
+    slots: Sequence[ChicagoSlot],
+    tolerance_minutes: int,
+    schedule: str,
+) -> Optional[str]:
+    """Return a skip line for a scheduled run, or None when the run should proceed.
+
+    workflow_dispatch and any other event bypass the guard. --require-chicago-hour
+    keeps the single-hour gate. --require-chicago-slots matches an America/Chicago
+    weekday and clock time, within tolerance_minutes.
+
+    When schedule is set, the cron instant itself is converted to Chicago and must
+    land on an allowed slot. The run may start up to tolerance_minutes away from
+    that instant. Matching the delayed local clock against every slot would
+    double-fire: 4:15 and 5:00 are 45 minutes apart, and the other daylight-saving
+    registration is 60 minutes off, so it falls inside a ±40 minute window of the
+    neighboring slot.
+    """
+    if event != "schedule":
+        return None
+    if require_chicago_hour is None and not slots:
+        return None
+    local = chicago_now(now)
+    stamp = chicago_stamp(local)
+    if require_chicago_hour is not None and local.hour != require_chicago_hour:
+        return (
+            "Scheduled KPI refresh skipped: America/Chicago local time is "
+            f"{stamp}, outside the {require_chicago_hour:02d}:00 hour. "
+            "No request was sent."
+        )
+    if not slots:
+        return None
+    tolerance = timedelta(minutes=tolerance_minutes)
+    labels = format_slots(slots)
+    cron_text = " ".join(schedule.split())
+    if cron_text:
+        cron = parse_cron_schedule(cron_text)
+        instant = nearest_cron_instant(local, cron)
+        if instant is None:
+            return (
+                "Scheduled refresh skipped: America/Chicago local time is "
+                f"{stamp}. Cron '{cron_text}' has no matching occurrence. "
+                "No request was sent."
+            )
+        nominal = instant.astimezone(CHICAGO)
+        nominal_slot = ChicagoSlot(nominal.weekday(), nominal.hour, nominal.minute)
+        nominal_stamp = chicago_stamp(nominal)
+        delta = abs(local.astimezone(timezone.utc) - instant)
+        if nominal_slot not in set(slots):
+            return (
+                "Scheduled refresh skipped: cron "
+                f"'{cron_text}' is {nominal_stamp} America/Chicago, outside "
+                f"allowed slots {labels}. Local time is {stamp}. "
+                "No request was sent."
+            )
+        if delta > tolerance:
+            minutes = elapsed_minutes(delta)
+            unit = "minute" if minutes == 1 else "minutes"
+            return (
+                "Scheduled refresh skipped: America/Chicago local time is "
+                f"{stamp}, {minutes} {unit} from cron '{cron_text}' "
+                f"({nominal_stamp}, {nominal_slot.label()}), outside the "
+                f"±{tolerance_minutes} minute window for slots {labels}. "
+                "No request was sent."
+            )
+        return None
+    _slot, delta = closest_slot(local, slots)
+    if delta is not None and delta <= tolerance:
+        return None
+    return (
+        "Scheduled refresh skipped: America/Chicago local time is "
+        f"{stamp}, outside allowed slots {labels} "
+        f"(±{tolerance_minutes} minutes). No request was sent."
+    )
+
+
 def backoff_before(attempt: int, schedule: Sequence[float]) -> float:
     """Seconds to wait before attempt N (1-based). Attempt 1 waits zero."""
     if attempt <= 1:
@@ -547,20 +780,16 @@ def _attempt_log(attempt: int, max_attempts: int, err: RefreshError) -> str:
 
 def execute(config: Config, transport: Transport, sleeper: Sleeper) -> Outcome:
     label = "Sales" if config.profile == "sales" else "KPI"
-    if config.event == "schedule" and config.require_chicago_hour is not None:
-        local = chicago_now(config.now)
-        if local.hour != config.require_chicago_hour:
-            stamp = local.strftime("%Y-%m-%d %H:%M %Z")
-            return Outcome(
-                kind="skipped",
-                attempts=0,
-                logs=[],
-                message=(
-                    "Scheduled KPI refresh skipped: America/Chicago local time is "
-                    f"{stamp}, outside the {config.require_chicago_hour:02d}:00 hour. "
-                    "No request was sent."
-                ),
-            )
+    skip = schedule_skip_message(
+        event=config.event,
+        now=config.now,
+        require_chicago_hour=config.require_chicago_hour,
+        slots=config.require_chicago_slots,
+        tolerance_minutes=config.chicago_slot_tolerance_minutes,
+        schedule=config.schedule,
+    )
+    if skip is not None:
+        return Outcome(kind="skipped", attempts=0, logs=[], message=skip)
     path = normalize_path(config.path, config.profile)
     if path == "":
         return Outcome(
@@ -658,6 +887,22 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--event", default=os.environ.get("GITHUB_EVENT_NAME", "local"))
     parser.add_argument("--require-chicago-hour", type=int)
     parser.add_argument(
+        "--require-chicago-slots",
+        default="",
+        help="Comma-separated America/Chicago slots such as Mon-00:15,Mon-04:15,Mon-05:00.",
+    )
+    parser.add_argument(
+        "--chicago-slot-tolerance-minutes",
+        type=int,
+        default=DEFAULT_SLOT_TOLERANCE_MINUTES,
+        help="Minutes a scheduled run may start before or after an allowed Chicago slot.",
+    )
+    parser.add_argument(
+        "--schedule",
+        default="",
+        help="Cron that triggered a scheduled run, from github.event.schedule.",
+    )
+    parser.add_argument(
         "--test-hooks",
         action="store_true",
         help="Enable test-only clock control. Do not set this in GitHub Actions.",
@@ -675,6 +920,15 @@ def config_from_args(args: argparse.Namespace) -> Config:
         raise RefreshError("max attempts must be from 1 to 5", retry=False)
     if args.require_chicago_hour is not None and not 0 <= args.require_chicago_hour <= 23:
         raise RefreshError("Chicago hour must be from 0 to 23", retry=False)
+    slots = parse_chicago_slots(args.require_chicago_slots)
+    if not 0 <= args.chicago_slot_tolerance_minutes <= 180:
+        raise RefreshError(
+            "Chicago slot tolerance must be from 0 to 180 minutes",
+            retry=False,
+        )
+    schedule = " ".join(args.schedule.split())
+    if schedule:
+        parse_cron_schedule(schedule)
     now = None
     if args.now:
         text = args.now.strip()
@@ -686,17 +940,25 @@ def config_from_args(args: argparse.Namespace) -> Config:
             raise RefreshError("--now must be an ISO-8601 timestamp", retry=False) from exc
         if now.tzinfo is None:
             raise RefreshError("--now must include a timezone offset", retry=False)
-    # Hour and empty-path skips happen before the token is required.
+    # Schedule and empty-path skips happen before the token is required.
     # A blank manual input falls through to the repository variable.
     path = args.path.strip() or args.path_fallback.strip()
     base_url = validate_base_url(args.base_url, args.allow_remote)
     token = ""
     token_source = args.token_env
     needs_token = True
-    if args.event == "schedule" and args.require_chicago_hour is not None:
-        local = chicago_now(now)
-        if local.hour != args.require_chicago_hour:
-            needs_token = False
+    if (
+        schedule_skip_message(
+            event=args.event,
+            now=now,
+            require_chicago_hour=args.require_chicago_hour,
+            slots=slots,
+            tolerance_minutes=args.chicago_slot_tolerance_minutes,
+            schedule=schedule,
+        )
+        is not None
+    ):
+        needs_token = False
     if args.profile == "kpi" and path == "":
         needs_token = False
     if needs_token:
@@ -712,6 +974,9 @@ def config_from_args(args: argparse.Namespace) -> Config:
         backoff=tuple(args.backoff_seconds),
         event=args.event,
         require_chicago_hour=args.require_chicago_hour,
+        require_chicago_slots=slots,
+        chicago_slot_tolerance_minutes=args.chicago_slot_tolerance_minutes,
+        schedule=schedule,
         now=now,
     )
 

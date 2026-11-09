@@ -39,7 +39,17 @@ The scheduler decides pass or fail from `ok: true` and the JSON content type. It
 
 Workflow: `.github/workflows/refresh-kpis.yml`
 
-The workflow is scheduled for 6:05 a.m. America/Chicago and can also be started with `workflow_dispatch`. GitHub cron accepts UTC only. The file registers `5 11 * * *` (6:05 a.m. Central Daylight Time) and `5 12 * * *` (6:05 a.m. Central Standard Time). Each scheduled run continues only while the America/Chicago hour is 06, so one of those two times performs the refresh and the other exits without calling the app. A manual run ignores that hour gate. A scheduled run that starts after 7:00 a.m. Chicago exits without calling the app.
+KPIs are weekly. The workflow runs on Monday only, at three America/Chicago times, and it can also be started with `workflow_dispatch`.
+
+| Chicago time | Why this time | Central Daylight Time (UTC-5) | Central Standard Time (UTC-6) |
+| --- | --- | --- | --- |
+| 12:15 a.m. Monday | La Viva can be final after midnight. | `15 5 * * 1` (05:15 UTC Monday) | `15 6 * * 1` (06:15 UTC Monday) |
+| 4:15 a.m. Monday | Two Zalat stores close around 3 a.m., so Zalat sales and labor are final only after 4 a.m. | `15 9 * * 1` (09:15 UTC Monday) | `15 10 * * 1` (10:15 UTC Monday) |
+| 5:00 a.m. Monday | Final refresh. Everything must be up by 5 a.m. | `0 10 * * 1` (10:00 UTC Monday) | `0 11 * * 1` (11:00 UTC Monday) |
+
+12:15 a.m. Chicago is still Monday in UTC under both offsets. GitHub cron is UTC and does not follow America/Chicago daylight-saving time, so each local time is registered twice. The scheduled job passes `--require-chicago-slots Mon-00:15,Mon-04:15,Mon-05:00` and the cron that started the run. The run continues only when that cron's Chicago clock time is one of those Monday slots and the job starts within ±40 minutes of the cron. The other daylight-saving registration exits successfully without calling the app. A manual `workflow_dispatch` bypasses the guard. `--require-chicago-hour` remains available and still limits a scheduled run to one America/Chicago hour. This workflow passes the Monday slot list.
+
+GitHub may start a scheduled run later than the cron time. The ±40 minute window covers that delay. A run that starts further away exits successfully without calling the app. 4:15 a.m. and 5:00 a.m. are 45 minutes apart, so the guard uses the triggering cron. A ±40 minute window around local time alone would treat the other offset's neighboring registration as a match.
 
 The concurrency group is `scoreboard-kpi-refresh`.
 
