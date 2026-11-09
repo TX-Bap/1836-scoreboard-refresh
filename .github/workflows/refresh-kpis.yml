@@ -1,0 +1,55 @@
+name: Refresh 1836 KPI snapshot
+
+on:
+  schedule:
+    # 6:05 a.m. America/Chicago. GitHub cron is UTC, so register both
+    # Central Daylight Time (11:05 UTC) and Central Standard Time (12:05 UTC).
+    # The script continues only when the local hour is 06, which keeps the
+    # refresh at 6:05 a.m. Chicago through daylight-saving changes.
+    - cron: "5 11 * * *"
+    - cron: "5 12 * * *"
+  workflow_dispatch:
+    inputs:
+      kpi_path:
+        description: "Path to POST. Leave empty to use KPI_REFRESH_PATH. The app contract path is /api/refresh-kpis."
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: scoreboard-kpi-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh-kpis:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out scheduler scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Refresh KPI snapshot
+        env:
+          SCOREBOARD_KPI_REFRESH_TOKEN: ${{ secrets.SCOREBOARD_KPI_REFRESH_TOKEN }}
+          SCOREBOARD_REFRESH_TOKEN: ${{ secrets.SCOREBOARD_REFRESH_TOKEN }}
+          KPI_PATH_INPUT: ${{ github.event.inputs.kpi_path }}
+          KPI_PATH_VAR: ${{ vars.KPI_REFRESH_PATH }}
+        run: |
+          set -euo pipefail
+          python3 scripts/refresh_call.py \
+            --profile kpi \
+            --path "${KPI_PATH_INPUT:-}" \
+            --path-fallback "${KPI_PATH_VAR:-}" \
+            --token-env SCOREBOARD_KPI_REFRESH_TOKEN \
+            --token-env-fallback SCOREBOARD_REFRESH_TOKEN \
+            --allow-remote \
+            --timeout-seconds 120 \
+            --max-attempts 3 \
+            --backoff-seconds 10,30 \
+            --event "${GITHUB_EVENT_NAME}" \
+            --require-chicago-hour 6
