@@ -47,9 +47,7 @@ def make_config(**overrides) -> refresh_call.Config:
         "backoff": (10, 30),
         "event": "workflow_dispatch",
         "require_chicago_hour": None,
-        "require_chicago_slots": (),
-        "chicago_slot_tolerance_minutes": 40,
-        "schedule": "",
+        "require_chicago_monday": False,
         "now": None,
     }
     values.update(overrides)
@@ -327,6 +325,7 @@ class ExecuteTests(unittest.TestCase):
             lambda delay: None,
         )
         self.assertEqual(skipped.kind, "skipped")
+        self.assertFalse(skipped.fail_job)
         self.assertIn("KPI_REFRESH_PATH is unset", skipped.message)
         self.assertIn("/api/refresh-kpis", skipped.message)
         self.assertIn("No request was sent", skipped.message)
@@ -344,6 +343,7 @@ class ExecuteTests(unittest.TestCase):
             lambda delay: None,
         )
         self.assertEqual(outside.kind, "skipped")
+        self.assertTrue(outside.fail_job)
         self.assertIn("America/Chicago", outside.message)
         self.assertIn("05:05", outside.message)
 
@@ -373,6 +373,7 @@ class ExecuteTests(unittest.TestCase):
             lambda delay: None,
         )
         self.assertEqual(summer_outside.kind, "skipped")
+        self.assertTrue(summer_outside.fail_job)
         self.assertIn("07:05", summer_outside.message)
 
         manual = refresh_call.execute(
@@ -436,9 +437,9 @@ class ExecuteTests(unittest.TestCase):
         dests = {action.dest for action in refresh_call.build_parser()._actions}
         self.assertIn("token_env", dests)
         self.assertIn("require_chicago_hour", dests)
-        self.assertIn("require_chicago_slots", dests)
-        self.assertIn("chicago_slot_tolerance_minutes", dests)
-        self.assertIn("schedule", dests)
+        self.assertIn("require_chicago_monday", dests)
+        self.assertNotIn("require_chicago_slots", dests)
+        self.assertNotIn("schedule", dests)
         self.assertNotIn("token", dests)
         backoff = next(
             action for action in refresh_call.build_parser()._actions if action.dest == "backoff_seconds"
@@ -756,9 +757,10 @@ class CliTests(unittest.TestCase):
                 "2026-01-15T11:05:00Z",
             ]
         )
-        self.assertEqual(hour_skip.returncode, 0, hour_skip.stderr)
+        self.assertEqual(hour_skip.returncode, 1, hour_skip.stdout)
         self.assertEqual(server.requests, [])
-        self.assertIn("05:05", hour_skip.stdout)
+        self.assertIn("05:05", hour_skip.stderr)
+        self.assertIn("No request was sent", hour_skip.stderr)
 
         body = ExecuteTests._kpi_body()
         authed = LoopbackServer(
@@ -903,87 +905,80 @@ class CliTests(unittest.TestCase):
         self.assertEqual(server.requests[0]["path"], "/api/refresh-kpis")
         self.assertIn("Token source: SCOREBOARD_KPI_REFRESH_TOKEN", completed.stdout)
 
-    def test_chicago_slot_cli_covers_skip_dispatch_and_bad_input(self):
+    def test_monday_guard_cli_fails_other_days_and_sends_on_monday(self):
         idle = LoopbackServer([])
         self.addCleanup(idle.close)
-        slot_args = [
+        guard_args = [
             "--profile",
             "kpi",
+            "--path",
+            "/api/refresh-kpis",
             "--token-env",
             "SCOREBOARD_KPI_REFRESH_TOKEN",
             "--base-url",
             idle.base_url,
-            "--require-chicago-slots",
-            KPI_SLOTS,
-            "--chicago-slot-tolerance-minutes",
-            "40",
+            "--event",
+            "schedule",
+            "--require-chicago-monday",
             "--test-hooks",
         ]
-        tuesday = self.run_cli(
-            [
-                *slot_args,
-                "--path",
-                "/api/refresh-kpis",
-                "--event",
-                "schedule",
-                "--schedule",
-                "15 6 * * 1",
-                "--now",
-                "2026-01-13T06:15:00Z",
-            ]
-        )
-        self.assertEqual(tuesday.returncode, 0, tuesday.stderr)
+        # 05:15 UTC Monday is still Sunday evening in Chicago during CST.
+        sunday = self.run_cli([*guard_args, "--now", "2026-11-16T05:15:00Z"])
+        self.assertEqual(sunday.returncode, 1, sunday.stdout)
         self.assertEqual(idle.requests, [])
-        self.assertIn("2026-01-13 00:15", tuesday.stdout)
-        self.assertIn("No request was sent", tuesday.stdout)
-        self.assertIn("::notice::", self.run_cli(
-            [
-                *slot_args,
-                "--path",
-                "/api/refresh-kpis",
-                "--event",
-                "schedule",
-                "--schedule",
-                "0 10 * * 1",
-                "--now",
-                "2026-01-12T10:00:00Z",
-            ],
-            {"GITHUB_ACTIONS": "true"},
-        ).stdout)
+        self.assertIn("2026-11-15 23:15", sunday.stderr)
+        self.assertIn("Sun", sunday.stderr)
+        self.assertIn("not Monday", sunday.stderr)
+        self.assertIn("No request was sent", sunday.stderr)
+        self.assertNotIn("SCOREBOARD_KPI_REFRESH_TOKEN is unset", sunday.stderr)
 
-        summer = LoopbackServer(
-            [{"status": 200, "content_type": "application/json", "body": ExecuteTests._kpi_body()}]
+        annotated = self.run_cli(
+            [*guard_args, "--now", "2026-01-13T11:15:00Z"],
+            {"GITHUB_ACTIONS": "true"},
         )
-        self.addCleanup(summer.close)
-        matched = self.run_cli(
-            [
-                "--profile",
-                "kpi",
-                "--path",
-                "/api/refresh-kpis",
-                "--token-env",
-                "SCOREBOARD_KPI_REFRESH_TOKEN",
-                "--base-url",
-                summer.base_url,
-                "--timeout-seconds",
-                "5",
-                "--max-attempts",
-                "1",
-                "--event",
-                "schedule",
-                "--require-chicago-slots",
-                KPI_SLOTS,
-                "--schedule",
-                "15 5 * * 1",
-                "--test-hooks",
-                "--now",
-                "2026-07-13T05:15:00Z",
-            ],
-            {"SCOREBOARD_KPI_REFRESH_TOKEN": FIXTURE_TOKEN},
-        )
-        self.assertEqual(matched.returncode, 0, matched.stderr)
-        self.assertEqual(len(summer.requests), 1)
-        self.assertIn("KPI refresh succeeded", matched.stdout)
+        self.assertEqual(annotated.returncode, 1)
+        self.assertIn("2026-01-13 05:15", annotated.stderr)
+        self.assertIn("Tue", annotated.stderr)
+        self.assertIn("::error::", annotated.stderr)
+        self.assertNotIn("::notice::", annotated.stdout + annotated.stderr)
+        self.assertEqual(idle.requests, [])
+
+        def monday_run(stamp):
+            server = LoopbackServer(
+                [{"status": 200, "content_type": "application/json", "body": ExecuteTests._kpi_body()}]
+            )
+            self.addCleanup(server.close)
+            completed = self.run_cli(
+                [
+                    "--profile",
+                    "kpi",
+                    "--path",
+                    "/api/refresh-kpis",
+                    "--token-env",
+                    "SCOREBOARD_KPI_REFRESH_TOKEN",
+                    "--base-url",
+                    server.base_url,
+                    "--timeout-seconds",
+                    "5",
+                    "--max-attempts",
+                    "1",
+                    "--event",
+                    "schedule",
+                    "--require-chicago-monday",
+                    "--test-hooks",
+                    "--now",
+                    stamp,
+                ],
+                {"SCOREBOARD_KPI_REFRESH_TOKEN": FIXTURE_TOKEN},
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertEqual(len(server.requests), 1)
+            self.assertIn("KPI refresh succeeded", completed.stdout)
+            return completed
+
+        monday_run("2026-01-12T11:15:00Z")  # 05:15 CST Monday
+        monday_run("2026-07-13T10:45:00Z")  # 05:45 CDT Monday
+        monday_run("2026-11-16T13:34:00Z")  # 07:34 CST Monday, the delayed run
 
         dispatch = LoopbackServer(
             [{"status": 200, "content_type": "application/json", "body": ExecuteTests._kpi_body()}]
@@ -1005,51 +1000,15 @@ class CliTests(unittest.TestCase):
                 "1",
                 "--event",
                 "workflow_dispatch",
-                "--require-chicago-slots",
-                KPI_SLOTS,
-                "--schedule",
-                "15 6 * * 1",
+                "--require-chicago-monday",
                 "--test-hooks",
                 "--now",
-                "2026-01-13T18:00:00Z",
+                "2026-11-16T05:15:00Z",
             ],
             {"SCOREBOARD_KPI_REFRESH_TOKEN": FIXTURE_TOKEN},
         )
         self.assertEqual(manual.returncode, 0, manual.stderr)
         self.assertEqual(len(dispatch.requests), 1)
-
-        rejected = self.run_cli(
-            [
-                *slot_args,
-                "--path",
-                "",
-                "--event",
-                "schedule",
-                "--require-chicago-slots",
-                "Mon-25:00",
-                "--now",
-                "2026-01-12T06:15:00Z",
-            ]
-        )
-        self.assertEqual(rejected.returncode, 1)
-        self.assertIn("Chicago slot", rejected.stderr)
-        self.assertEqual(idle.requests, [])
-
-        bad_cron = self.run_cli(
-            [
-                *slot_args,
-                "--path",
-                "",
-                "--event",
-                "schedule",
-                "--schedule",
-                "not-a-cron",
-                "--now",
-                "2026-01-12T06:15:00Z",
-            ]
-        )
-        self.assertEqual(bad_cron.returncode, 1)
-        self.assertIn("5-field cron", bad_cron.stderr)
 
     def test_now_requires_the_test_hook(self):
         completed = self.run_cli(
@@ -1070,15 +1029,12 @@ class CliTests(unittest.TestCase):
         self.assertIn("--test-hooks", completed.stderr)
 
 
-KPI_SLOTS = "Mon-00:15,Mon-04:15,Mon-05:00"
-
-
 def _utc(stamp: str) -> datetime:
     return datetime.fromisoformat(stamp.replace("Z", "+00:00"))
 
 
 class ScheduleGuardTests(unittest.TestCase):
-    def _run_guard(self, stamp, schedule, *, event="schedule", tolerance=40, hour=None, path="/api/refresh-kpis", token=None, slots=KPI_SLOTS):
+    def _run_guard(self, stamp, *, event="schedule", hour=None, path="/api/refresh-kpis", token=None, monday=True):
         expect_call = token is not None
         transport = RecordingTransport([(200, "application/json", ExecuteTests._kpi_body())])
 
@@ -1092,9 +1048,7 @@ class ScheduleGuardTests(unittest.TestCase):
                 token="" if token is None else token,
                 event=event,
                 require_chicago_hour=hour,
-                require_chicago_slots=refresh_call.parse_chicago_slots(slots),
-                chicago_slot_tolerance_minutes=tolerance,
-                schedule=schedule,
+                require_chicago_monday=monday,
                 now=_utc(stamp),
             ),
             transport if expect_call else boom,
@@ -1102,114 +1056,112 @@ class ScheduleGuardTests(unittest.TestCase):
         )
         return outcome, transport
 
-    def test_dst_monday_slots_and_tuesday_and_tolerance(self):
+    def test_monday_guard_allows_cst_cdt_and_late_starts(self):
         cases = (
-            # Winter CST Monday: only the UTC-6 registrations match.
-            ("2026-01-12T06:15:00Z", "15 6 * * 1", "success", ""),
-            ("2026-01-12T05:15:00Z", "15 5 * * 1", "skipped", "outside allowed slots"),
-            ("2026-01-12T10:15:00Z", "15 10 * * 1", "success", ""),
-            ("2026-01-12T09:15:00Z", "15 9 * * 1", "skipped", "outside allowed slots"),
-            ("2026-01-12T11:00:00Z", "0 11 * * 1", "success", ""),
-            # CDT 5:00 cron during CST is 04:00, 15 minutes from the 4:15 slot.
-            ("2026-01-12T10:00:00Z", "0 10 * * 1", "skipped", "outside allowed slots"),
-            # Summer CDT Monday: only the UTC-5 registrations match.
-            ("2026-07-13T05:15:00Z", "15 5 * * 1", "success", ""),
-            ("2026-07-13T06:15:00Z", "15 6 * * 1", "skipped", "outside allowed slots"),
-            ("2026-07-13T09:15:00Z", "15 9 * * 1", "success", ""),
-            # CST 4:15 cron during CDT is 05:15, 15 minutes from the 5:00 slot.
-            ("2026-07-13T10:15:00Z", "15 10 * * 1", "skipped", "outside allowed slots"),
-            ("2026-07-13T10:00:00Z", "0 10 * * 1", "success", ""),
-            ("2026-07-13T11:00:00Z", "0 11 * * 1", "skipped", "outside allowed slots"),
+            # CST Monday morning, including each redundant cron instant.
+            ("2026-01-12T10:15:00Z", "04:15"),
+            ("2026-01-12T10:45:00Z", "04:45"),
+            ("2026-01-12T11:15:00Z", "05:15"),
+            ("2026-01-12T11:45:00Z", "05:45"),
+            # CDT Monday morning.
+            ("2026-07-13T10:15:00Z", "05:15"),
+            ("2026-07-13T10:45:00Z", "05:45"),
+            ("2026-07-13T11:15:00Z", "06:15"),
+            ("2026-07-13T11:45:00Z", "06:45"),
             # Monday after the March and November transitions.
-            ("2026-03-09T05:15:00Z", "15 5 * * 1", "success", ""),
-            ("2026-03-09T06:15:00Z", "15 6 * * 1", "skipped", "outside allowed slots"),
-            ("2026-03-09T10:00:00Z", "0 10 * * 1", "success", ""),
-            ("2026-11-02T06:15:00Z", "15 6 * * 1", "success", ""),
-            ("2026-11-02T05:15:00Z", "15 5 * * 1", "skipped", "outside allowed slots"),
-            ("2026-11-02T11:00:00Z", "0 11 * * 1", "success", ""),
-            ("2026-11-02T10:00:00Z", "0 10 * * 1", "skipped", "outside allowed slots"),
-            # Tuesday does not match a Monday cron, in either offset.
-            ("2026-01-13T06:15:00Z", "15 6 * * 1", "skipped", "2026-01-13 00:15"),
-            ("2026-07-14T05:15:00Z", "15 5 * * 1", "skipped", "2026-07-14 00:15"),
-            # ±40 minutes from the triggering cron, including the early side.
-            ("2026-07-13T10:40:00Z", "0 10 * * 1", "success", ""),
-            ("2026-07-13T10:41:00Z", "0 10 * * 1", "skipped", "41 minutes"),
-            ("2026-07-13T09:20:00Z", "0 10 * * 1", "success", ""),
-            ("2026-07-13T09:19:00Z", "0 10 * * 1", "skipped", "41 minutes"),
-            ("2026-01-12T06:55:00Z", "15 6 * * 1", "success", ""),
-            ("2026-01-12T06:56:00Z", "15 6 * * 1", "skipped", "41 minutes"),
-            # Without a cron, local Chicago time matches a slot inside ±40 minutes.
-            ("2026-01-12T06:15:00Z", "", "success", ""),
-            ("2026-07-13T05:15:00Z", "", "success", ""),
-            ("2026-01-12T05:15:00Z", "", "skipped", "outside allowed slots"),
-            ("2026-07-13T06:15:00Z", "", "skipped", "outside allowed slots"),
-            ("2026-01-13T06:15:00Z", "", "skipped", "2026-01-13 00:15"),
-            ("2026-01-12T08:30:00Z", "", "skipped", "outside allowed slots"),
-            ("2026-01-12T05:35:00Z", "", "success", ""),
-            ("2026-01-12T05:34:00Z", "", "skipped", "outside allowed slots"),
-            ("2026-01-12T06:55:00Z", "", "success", ""),
-            ("2026-01-12T06:56:00Z", "", "skipped", "outside allowed slots"),
-            ("2026-07-13T04:35:00Z", "", "success", ""),
-            ("2026-07-13T04:34:00Z", "", "skipped", "outside allowed slots"),
-            # Local window alone accepts the neighboring DST registration.
-            ("2026-07-13T10:15:00Z", "", "success", ""),
-            ("2026-01-12T10:00:00Z", "", "success", ""),
+            ("2026-03-09T10:45:00Z", "05:45"),
+            ("2026-11-02T11:15:00Z", "05:15"),
+            # Late Monday starts still refresh. 13:34Z is the delayed Nov 16 run.
+            ("2026-11-16T13:34:00Z", "07:34"),
+            ("2026-01-12T18:34:00Z", "12:34"),
+            ("2026-07-13T23:30:00Z", "18:30"),
+            ("2026-11-16T12:59:00Z", "06:59"),
         )
-        for stamp, schedule, expected, needle in cases:
-            with self.subTest(stamp=stamp, schedule=schedule or "(local)", expected=expected):
-                token = FIXTURE_TOKEN if expected == "success" else None
-                outcome, transport = self._run_guard(stamp, schedule, token=token)
-                self.assertEqual(outcome.kind, expected)
-                if expected == "success":
-                    self.assertEqual(len(transport.calls), 1)
-                    self.assertIn("KPI refresh succeeded", outcome.message)
-                    assert_no_token(self, outcome.message)
-                else:
-                    self.assertEqual(outcome.attempts, 0)
-                    self.assertIn("No request was sent", outcome.message)
-                    self.assertIn("America/Chicago", outcome.message)
-                    if needle:
-                        self.assertIn(needle, outcome.message)
-                    assert_no_token(self, outcome.message)
+        for stamp, _local in cases:
+            with self.subTest(stamp=stamp):
+                outcome, transport = self._run_guard(stamp, token=FIXTURE_TOKEN)
+                self.assertEqual(outcome.kind, "success")
+                self.assertFalse(outcome.fail_job)
+                self.assertEqual(len(transport.calls), 1)
+                self.assertIn("KPI refresh succeeded", outcome.message)
+                assert_no_token(self, outcome.message)
+                local = _utc(stamp).astimezone(refresh_call.CHICAGO)
+                self.assertEqual(local.strftime("%H:%M"), _local)
+                self.assertEqual(local.weekday(), 0)
 
-    def test_workflow_dispatch_bypasses_slots_and_a_misleading_cron(self):
+    def test_non_monday_schedule_skips_and_fails_the_job(self):
+        cases = (
+            # On-time 15 5 * * 1 in winter is still Sunday evening in Chicago.
+            ("2026-11-16T05:15:00Z", "2026-11-15 23:15", "Sun"),
+            # Tuesday morning in both offsets.
+            ("2026-01-13T11:15:00Z", "2026-01-13 05:15", "Tue"),
+            ("2026-07-14T10:15:00Z", "2026-07-14 05:15", "Tue"),
+            # Sunday evening CDT, which is already Monday in UTC.
+            ("2026-07-13T04:15:00Z", "2026-07-12 23:15", "Sun"),
+        )
+        for stamp, needle, weekday in cases:
+            with self.subTest(stamp=stamp):
+                outcome, transport = self._run_guard(stamp)
+                self.assertEqual(outcome.kind, "skipped")
+                self.assertTrue(outcome.fail_job)
+                self.assertEqual(outcome.attempts, 0)
+                self.assertEqual(transport.calls, [])
+                self.assertIn(needle, outcome.message)
+                self.assertIn(f"({weekday})", outcome.message)
+                self.assertIn("not Monday", outcome.message)
+                self.assertIn("No request was sent", outcome.message)
+                self.assertIn("America/Chicago", outcome.message)
+                assert_no_token(self, outcome.message)
+
+    def test_workflow_dispatch_bypasses_the_monday_guard(self):
+        for stamp in ("2026-01-13T18:00:00Z", "2026-11-16T05:15:00Z"):
+            with self.subTest(stamp=stamp):
+                outcome, transport = self._run_guard(
+                    stamp,
+                    event="workflow_dispatch",
+                    token=FIXTURE_TOKEN,
+                )
+                self.assertEqual(outcome.kind, "success")
+                self.assertFalse(outcome.fail_job)
+                self.assertEqual(len(transport.calls), 1)
+
+    def test_monday_guard_is_opt_in_for_scheduled_kpi_runs(self):
         outcome, transport = self._run_guard(
-            "2026-01-13T18:00:00Z",
-            "15 6 * * 1",
-            event="workflow_dispatch",
+            "2026-01-13T11:15:00Z",
+            monday=False,
             token=FIXTURE_TOKEN,
         )
         self.assertEqual(outcome.kind, "success")
         self.assertEqual(len(transport.calls), 1)
 
-    def test_matching_slot_with_an_empty_path_skips_before_the_request(self):
-        outcome, _transport = self._run_guard(
-            "2026-01-12T06:15:00Z",
-            "15 6 * * 1",
+    def test_empty_path_on_monday_stays_a_successful_skip(self):
+        outcome, transport = self._run_guard(
+            "2026-01-12T11:15:00Z",
             path="  ",
             token="",
         )
         self.assertEqual(outcome.kind, "skipped")
+        self.assertFalse(outcome.fail_job)
+        self.assertEqual(transport.calls, [])
         self.assertIn("KPI_REFRESH_PATH is unset", outcome.message)
         self.assertIn("No request was sent", outcome.message)
 
     def test_hour_gate_still_skips_and_still_allows_the_matching_hour(self):
         skipped, _transport = self._run_guard(
             "2026-01-15T11:05:00Z",
-            "",
             hour=6,
-            slots="",
+            monday=False,
             token=None,
         )
         self.assertEqual(skipped.kind, "skipped")
+        self.assertTrue(skipped.fail_job)
         self.assertIn("05:05", skipped.message)
         self.assertIn("06:00 hour", skipped.message)
 
         allowed, transport = self._run_guard(
             "2026-01-15T12:05:00Z",
-            "",
             hour=6,
-            slots="",
+            monday=False,
             token=FIXTURE_TOKEN,
         )
         self.assertEqual(allowed.kind, "success")
@@ -1217,14 +1169,24 @@ class ScheduleGuardTests(unittest.TestCase):
 
         manual, manual_transport = self._run_guard(
             "2026-01-15T11:05:00Z",
-            "",
             event="workflow_dispatch",
             hour=6,
-            slots="",
             token=FIXTURE_TOKEN,
         )
         self.assertEqual(manual.kind, "success")
         self.assertEqual(len(manual_transport.calls), 1)
+
+        # Monday wins over a matching hour when the local day is not Monday.
+        # 2026-01-13 12:05Z is 06:05 CST Tuesday.
+        tuesday, tuesday_transport = self._run_guard(
+            "2026-01-13T12:05:00Z",
+            hour=6,
+            token=None,
+        )
+        self.assertEqual(tuesday.kind, "skipped")
+        self.assertTrue(tuesday.fail_job)
+        self.assertIn("not Monday", tuesday.message)
+        self.assertEqual(tuesday_transport.calls, [])
 
     def test_sales_schedule_without_a_guard_still_calls(self):
         transport = RecordingTransport([(200, "application/json", b'{"ok": true}')])
@@ -1239,22 +1201,25 @@ class ScheduleGuardTests(unittest.TestCase):
         self.assertEqual(outcome.kind, "success")
         self.assertEqual(len(transport.calls), 1)
 
-    def test_parser_rejects_bad_slots_crons_and_tolerance(self):
-        parsed = refresh_call.parse_chicago_slots("Mon-00:15, mon-04:15,Mon-00:15,")
-        self.assertEqual([slot.label() for slot in parsed], ["Mon-00:15", "Mon-04:15"])
-        self.assertEqual(refresh_call.parse_chicago_slots("  "), ())
-        sunday = refresh_call.parse_cron_schedule("0 11 * * 7")
-        self.assertEqual(sunday.dow, 0)
-        monday = refresh_call.parse_cron_schedule("15 5 * * 1")
-        self.assertEqual((monday.minute, monday.hour, monday.dow), (15, 5, 1))
-        for text in ("Mon-24:00", "Monday-00:15", "Mon-00:15,Foo-01:00", "00:15", "Mon-4:15"):
-            with self.subTest(text=text):
-                with self.assertRaises(refresh_call.RefreshError):
-                    refresh_call.parse_chicago_slots(text)
-        for text in ("15 5 * *", "15 * * * 1", "15 5 * * 8"):
-            with self.subTest(text=text):
-                with self.assertRaises(refresh_call.RefreshError):
-                    refresh_call.parse_cron_schedule(text)
+    def test_chicago_hour_outside_0_to_23_is_rejected(self):
+        parser = refresh_call.build_parser()
+        args = parser.parse_args(
+            [
+                "--profile",
+                "kpi",
+                "--path",
+                "/api/refresh-kpis",
+                "--token-env",
+                "SCOREBOARD_KPI_REFRESH_TOKEN",
+                "--base-url",
+                "http://127.0.0.1:9",
+                "--require-chicago-hour",
+                "24",
+            ]
+        )
+        with self.assertRaises(refresh_call.RefreshError) as caught:
+            refresh_call.config_from_args(args)
+        self.assertIn("Chicago hour", caught.exception.reason)
 
 
 class WorkflowContractTests(unittest.TestCase):
@@ -1284,21 +1249,28 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertNotIn("KPI_REFRESH_PATH", sales)
         self.assertNotIn("--require-chicago-slots", sales)
         self.assertNotIn("--require-chicago-hour", sales)
+        self.assertNotIn("--require-chicago-monday", sales)
         self.assertNotIn("hunger", sales.lower())
 
         monday_crons = (
-            "15 5 * * 1",
-            "15 6 * * 1",
-            "15 9 * * 1",
             "15 10 * * 1",
-            "0 10 * * 1",
-            "0 11 * * 1",
+            "45 10 * * 1",
+            "15 11 * * 1",
+            "45 11 * * 1",
         )
         for cron in monday_crons:
             self.assertIn(f'cron: "{cron}"', kpi)
             self.assertIn(f"`{cron}`", readme)
-        self.assertNotIn('cron: "5 11 * * *"', kpi)
-        self.assertNotIn('cron: "5 12 * * *"', kpi)
+        for retired in (
+            "15 5 * * 1",
+            "15 6 * * 1",
+            "15 9 * * 1",
+            "0 10 * * 1",
+            "0 11 * * 1",
+            "5 11 * * *",
+            "5 12 * * *",
+        ):
+            self.assertNotIn(f'cron: "{retired}"', kpi)
         self.assertNotIn("6:05", kpi)
         self.assertNotIn("6:05", readme)
         self.assertIn("workflow_dispatch:", kpi)
@@ -1314,10 +1286,10 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertIn("KPI_PATH_VAR", kpi)
         self.assertIn("--token-env SCOREBOARD_KPI_REFRESH_TOKEN", kpi)
         self.assertIn("--token-env-fallback SCOREBOARD_REFRESH_TOKEN", kpi)
-        self.assertIn("--require-chicago-slots Mon-00:15,Mon-04:15,Mon-05:00", kpi)
-        self.assertIn("--chicago-slot-tolerance-minutes 40", kpi)
-        self.assertIn("--schedule", kpi)
-        self.assertIn("KPI_SCHEDULE", kpi)
+        self.assertIn("--require-chicago-monday", kpi)
+        self.assertNotIn("--require-chicago-slots", kpi)
+        self.assertNotIn("--chicago-slot-tolerance-minutes", kpi)
+        self.assertNotIn("KPI_SCHEDULE", kpi)
         self.assertNotIn("--require-chicago-hour", kpi)
         self.assertIn("--timeout-seconds 120", kpi)
         self.assertIn("--allow-remote", kpi)
@@ -1349,11 +1321,14 @@ class WorkflowContractTests(unittest.TestCase):
             "stale",
             "lastError",
             "America/Chicago",
-            "12:15 a.m.",
+            "before 7:00 a.m.",
+            "4:30",
+            "6:30",
             "4:15 a.m.",
-            "5:00 a.m.",
-            "Mon-00:15,Mon-04:15,Mon-05:00",
-            "±40",
+            "6:45 a.m.",
+            "--require-chicago-monday",
+            "idempotent",
+            "exits non-zero",
             "Monday",
             "HTML",
             "python3 scripts/test_refresh_call.py",
@@ -1366,6 +1341,41 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertNotIn(FIXTURE_TOKEN, script)
         self.assertNotIn("hungerrush", script.lower())
         self.assertNotIn("hunger_rush", script.lower())
+        self._assert_crons_finish_before_7(kpi)
+
+    def _assert_crons_finish_before_7(self, kpi: str) -> None:
+        import re
+
+        crons = re.findall(r'cron:\s*"([^"]+)"', kpi)
+        self.assertEqual(
+            crons,
+            ["15 10 * * 1", "45 10 * * 1", "15 11 * * 1", "45 11 * * 1"],
+        )
+        seasons = (
+            ("CST", datetime(2026, 1, 12, tzinfo=timezone.utc)),
+            ("CDT", datetime(2026, 7, 13, tzinfo=timezone.utc)),
+        )
+        for label, day in seasons:
+            local_minutes = []
+            for cron in crons:
+                minute, hour, dom, month, dow = cron.split()
+                self.assertEqual((dom, month, dow), ("*", "*", "1"))
+                moment = datetime(
+                    day.year,
+                    day.month,
+                    day.day,
+                    int(hour),
+                    int(minute),
+                    tzinfo=timezone.utc,
+                )
+                local = moment.astimezone(refresh_call.CHICAGO)
+                self.assertEqual(local.weekday(), 0, f"{label} {cron} is {local}")
+                minute_of_day = local.hour * 60 + local.minute
+                # 6:45 a.m. leaves the 10-minute job timeout inside the 7:00 deadline.
+                self.assertLessEqual(minute_of_day, 6 * 60 + 45, f"{label} {cron} is {local}")
+                local_minutes.append(minute_of_day)
+            in_window = [item for item in local_minutes if 4 * 60 + 30 <= item <= 6 * 60 + 30]
+            self.assertTrue(in_window, f"{label} has no cron between 4:30 and 6:30 a.m.")
 
 
 if __name__ == "__main__":
