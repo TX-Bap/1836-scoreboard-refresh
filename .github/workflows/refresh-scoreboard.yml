@@ -9,6 +9,8 @@ on:
 
 permissions:
   contents: read
+  # Needed so this workflow can dispatch refresh-kpis.yml with GITHUB_TOKEN.
+  actions: write
 
 concurrency:
   group: scoreboard-sales-refresh
@@ -37,3 +39,68 @@ jobs:
             --timeout-seconds 60 \
             --max-attempts 3 \
             --backoff-seconds 10,30
+
+  dispatch-monday-kpi-backup:
+    name: Dispatch Monday KPI backup if needed
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Dispatch refresh-kpis.yml when the Monday window has no successful run
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+
+          dow_utc="$(date -u +%u)"
+          hour_utc="$(date -u +%H)"
+          minute_utc="$(date -u +%M)"
+          hm_utc=$((10#$hour_utc * 60 + 10#$minute_utc))
+          today_utc="$(date -u +%Y-%m-%d)"
+
+          # Monday 10:20-12:30 UTC is 4:20-6:30 a.m. CST and 5:20-7:30 a.m. CDT.
+          if [ "$dow_utc" != "1" ] || [ "$hm_utc" -lt 620 ] || [ "$hm_utc" -gt 750 ]; then
+            echo "Outside Monday 10:20-12:30 UTC window; skipping KPI dispatch."
+            exit 0
+          fi
+
+          echo "Inside Monday 10:20-12:30 UTC backup window (${today_utc})."
+
+          runs_file="$(mktemp)"
+          gh api \
+            --method GET \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/refresh-kpis.yml/runs" \
+            -f "created=>=${today_utc}" \
+            -F per_page=100 \
+            > "$runs_file"
+
+          blocking_count="$(
+            jq '[.workflow_runs[]? | select(
+              .conclusion == "success"
+              or (.status == "in_progress")
+              or (.status == "queued")
+              or (.status == "waiting")
+              or (.status == "pending")
+              or (.status == "requested")
+            )] | length' "$runs_file"
+          )"
+
+          if [ "$blocking_count" != "0" ]; then
+            echo "A successful or in-progress refresh-kpis.yml run already exists for today; not dispatching."
+            jq -r '[.workflow_runs[]? | select(
+              .conclusion == "success"
+              or (.status == "in_progress")
+              or (.status == "queued")
+              or (.status == "waiting")
+              or (.status == "pending")
+              or (.status == "requested")
+            )] | .[:8][] | "\(.html_url) status=\(.status) conclusion=\(.conclusion)"' "$runs_file"
+            exit 0
+          fi
+
+          echo "No successful refresh-kpis.yml run for today yet; dispatching."
+          gh api \
+            --method POST \
+            "repos/${GITHUB_REPOSITORY}/actions/workflows/refresh-kpis.yml/dispatches" \
+            -f "ref=${DEFAULT_BRANCH}"
+          echo "Dispatched refresh-kpis.yml on ${DEFAULT_BRANCH}."

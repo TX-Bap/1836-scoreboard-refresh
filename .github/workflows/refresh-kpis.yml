@@ -20,6 +20,12 @@ on:
     - cron: "15 11 * * 1"
     # 11:45 UTC Monday — 5:45 a.m. CST / 6:45 a.m. CDT
     - cron: "45 11 * * 1"
+    # 12:15 UTC Monday — 6:15 a.m. CST / 7:15 a.m. CDT
+    # Last-resort backup if the four earlier Monday crons are all dropped.
+    # During CDT this starts after 7:00 a.m. The sales workflow dispatch
+    # (Monday 10:20-12:30 UTC) is the backup that can still finish before
+    # 7:00 a.m. in both seasons.
+    - cron: "15 12 * * 1"
   workflow_dispatch:
     inputs:
       kpi_path:
