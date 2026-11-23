@@ -1222,6 +1222,135 @@ class ScheduleGuardTests(unittest.TestCase):
         self.assertIn("Chicago hour", caught.exception.reason)
 
 
+KPI_OK_BODY = json.dumps(
+    {
+        "ok": True,
+        "builtAt": "2026-11-23T12:05:00Z",
+        "weeksUpdated": 2,
+        "sources": {
+            "toast": {
+                "lastSuccess": "2026-11-23T12:00:00Z",
+                "coverage": "2026-11-16/2026-11-23",
+                "stale": False,
+            }
+        },
+        "lastError": None,
+    }
+).encode()
+
+
+class KpiRangeTests(unittest.TestCase):
+    def _run(self, **overrides):
+        transport = RecordingTransport([(200, "application/json", KPI_OK_BODY)])
+        values = dict(profile="kpi", path="/api/refresh-kpis", event="workflow_dispatch")
+        values.update(overrides)
+        outcome = refresh_call.execute(make_config(**values), transport, lambda delay: None)
+        return outcome, transport
+
+    def test_default_sends_no_range(self):
+        outcome, transport = self._run(now=datetime(2026, 11, 23, 12, 5, tzinfo=timezone.utc))
+        self.assertEqual(outcome.kind, "success")
+        self.assertTrue(transport.calls[0]["url"].endswith("/api/refresh-kpis"))
+        self.assertNotIn("?", transport.calls[0]["url"])
+
+    def test_prior_and_current_on_a_monday_covers_the_prior_week_and_today(self):
+        # 6:05 a.m. CST Monday Nov 23, 2026.
+        outcome, transport = self._run(
+            kpi_range="prior-and-current",
+            now=datetime(2026, 11, 23, 12, 5, tzinfo=timezone.utc),
+        )
+        self.assertEqual(outcome.kind, "success")
+        self.assertTrue(
+            transport.calls[0]["url"].endswith("/api/refresh-kpis?start=2026-11-16&end=2026-11-23")
+        )
+        self.assertIn("2026-11-16 through 2026-11-23", "\n".join(outcome.logs))
+        self.assertIn("?start=2026-11-16&end=2026-11-23", outcome.message)
+        assert_no_token(self, outcome.message + "\n".join(outcome.logs))
+
+    def test_prior_and_current_uses_the_chicago_date_not_utc(self):
+        # 03:30 UTC Tuesday is still 9:30 p.m. CST Monday Nov 23.
+        _, transport = self._run(
+            kpi_range="prior-and-current",
+            now=datetime(2026, 11, 24, 3, 30, tzinfo=timezone.utc),
+        )
+        self.assertTrue(transport.calls[0]["url"].endswith("?start=2026-11-16&end=2026-11-23"))
+        # Wednesday Nov 25 CST: prior week is still Nov 16-22.
+        _, transport = self._run(
+            kpi_range="prior-and-current",
+            now=datetime(2026, 11, 25, 18, 0, tzinfo=timezone.utc),
+        )
+        self.assertTrue(transport.calls[0]["url"].endswith("?start=2026-11-16&end=2026-11-25"))
+
+    def test_explicit_range_wins_and_end_defaults_to_today(self):
+        _, transport = self._run(
+            kpi_range="prior-and-current",
+            range_start="2026-11-09",
+            range_end="2026-11-22",
+            now=datetime(2026, 11, 23, 12, 5, tzinfo=timezone.utc),
+        )
+        self.assertTrue(transport.calls[0]["url"].endswith("?start=2026-11-09&end=2026-11-22"))
+        _, transport = self._run(
+            range_start="2026-11-16",
+            now=datetime(2026, 11, 23, 12, 5, tzinfo=timezone.utc),
+        )
+        self.assertTrue(transport.calls[0]["url"].endswith("?start=2026-11-16&end=2026-11-23"))
+
+    def test_bad_ranges_fail_without_a_call(self):
+        def boom(url, token, timeout):
+            raise AssertionError(f"unexpected call to {url}")
+
+        now = datetime(2026, 11, 23, 12, 5, tzinfo=timezone.utc)
+        bad = (
+            dict(range_start="11/16/2026"),
+            dict(range_start="2026-11-16", range_end="2026-11-15"),
+            dict(range_start="2026-11-16", range_end="2026-11-30"),
+            dict(range_start="2026-01-01"),
+            dict(range_end="2026-11-22"),
+            dict(range_start="2026-02-30"),
+            dict(kpi_range="everything"),
+            dict(range_start="2026-11-16&x=1"),
+        )
+        for extra in bad:
+            with self.assertRaises(refresh_call.RefreshError, msg=str(extra)):
+                refresh_call.execute(
+                    make_config(profile="kpi", path="/api/refresh-kpis", now=now, **extra),
+                    boom,
+                    lambda delay: None,
+                )
+
+    def test_sales_profile_ignores_the_range(self):
+        transport = RecordingTransport([(200, "application/json", b'{"ok": true}')])
+        refresh_call.execute(
+            make_config(kpi_range="prior-and-current", range_start="2026-11-16"),
+            transport,
+            lambda delay: None,
+        )
+        self.assertTrue(transport.calls[0]["url"].endswith("/api/refresh-sales"))
+
+    def test_cli_accepts_empty_range_values(self):
+        parser = refresh_call.build_parser()
+        args = parser.parse_args(
+            [
+                "--profile", "kpi",
+                "--path", "/api/refresh-kpis",
+                "--token-env", "UNSET_FOR_TEST",
+                "--kpi-range", "",
+                "--range-start", "",
+                "--range-end", "",
+                "--event", "workflow_dispatch",
+                "--base-url", "http://127.0.0.1:9",
+            ]
+        )
+        self.assertEqual(args.kpi_range, "")
+        os.environ["UNSET_FOR_TEST"] = FIXTURE_TOKEN
+        try:
+            config = refresh_call.config_from_args(args)
+        finally:
+            del os.environ["UNSET_FOR_TEST"]
+        self.assertEqual(config.kpi_range, "none")
+        self.assertIsNone(refresh_call.resolve_kpi_range(config))
+
+
 class WorkflowContractTests(unittest.TestCase):
     def test_workflows_and_readme_match_the_scheduler_contract(self):
         sales = (ROOT / ".github/workflows/refresh-scoreboard.yml").read_text()
@@ -1305,6 +1434,11 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertNotIn("--test-hooks", kpi)
         self.assertNotIn("--base-url", kpi)
         self.assertNotIn("hunger", kpi.lower())
+        self.assertIn("KPI_RANGE_MODE", kpi)
+        self.assertIn('--kpi-range "${KPI_RANGE_VAR:-none}"', kpi)
+        self.assertIn("range_start:", kpi)
+        self.assertIn("range_end:", kpi)
+        self.assertNotIn("--kpi-range", sales)
 
         self.assertIn("python3 scripts/test_refresh_call.py", tests)
         self.assertNotIn("secrets.", tests)

@@ -29,7 +29,7 @@ import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from typing import Callable, Optional, Sequence
 from urllib.parse import urlsplit, urlunsplit
 from zoneinfo import ZoneInfo
@@ -44,6 +44,9 @@ CHICAGO = ZoneInfo("America/Chicago")
 _WEEKDAY_LABELS = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 MAX_BODY_BYTES = 1_000_000
 EXCERPT_CHARS = 400
+KPI_RANGE_MODES = ("none", "prior-and-current")
+MAX_RANGE_DAYS = 62
+DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 PATH_RE = re.compile(r"^/[A-Za-z0-9._~/-]{1,200}$")
 SOURCE_NAME_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
 SALES_SUMMARY_KEYS = (
@@ -106,6 +109,12 @@ class Config:
     require_chicago_hour: Optional[int] = None
     require_chicago_monday: bool = False
     now: Optional[datetime] = None
+    # KPI only. "prior-and-current" asks the app to re-pull Monday of the prior
+    # Chicago week through today. Explicit range_start/range_end (YYYY-MM-DD)
+    # win over the mode. Sent as ?start=&end= query parameters; the body stays empty.
+    kpi_range: str = "none"
+    range_start: str = ""
+    range_end: str = ""
 
 
 def parse_backoff(text: str) -> tuple[float, ...]:
@@ -398,6 +407,44 @@ def chicago_now(now: Optional[datetime]) -> datetime:
     return now.astimezone(CHICAGO)
 
 
+def resolve_kpi_range(config: "Config") -> Optional[tuple[date, date]]:
+    """Return the (start, end) business dates to re-pull, or None for the app default."""
+    if config.profile != "kpi":
+        return None
+    today = chicago_now(config.now).date()
+    start_text = (config.range_start or "").strip()
+    end_text = (config.range_end or "").strip()
+    if start_text or end_text:
+        if not start_text:
+            raise RefreshError("range end was set without a range start", retry=False)
+        for label, text in (("range start", start_text), ("range end", end_text)):
+            if text and not DATE_RE.fullmatch(text):
+                raise RefreshError(f"{label} must be YYYY-MM-DD", retry=False)
+        try:
+            start = date.fromisoformat(start_text)
+            end = date.fromisoformat(end_text) if end_text else today
+        except ValueError as exc:
+            raise RefreshError("range dates must be valid YYYY-MM-DD dates", retry=False) from exc
+    else:
+        mode = (config.kpi_range or "none").strip() or "none"
+        if mode not in KPI_RANGE_MODES:
+            raise RefreshError(
+                f"KPI range mode must be one of {', '.join(KPI_RANGE_MODES)}", retry=False
+            )
+        if mode == "none":
+            return None
+        this_monday = today - timedelta(days=today.weekday())
+        start = this_monday - timedelta(days=7)
+        end = today
+    if end < start:
+        raise RefreshError("range end is before range start", retry=False)
+    if end > today:
+        raise RefreshError("range end is after today in America/Chicago", retry=False)
+    if (end - start).days + 1 > MAX_RANGE_DAYS:
+        raise RefreshError(f"range is longer than {MAX_RANGE_DAYS} days", retry=False)
+    return start, end
+
+
 def chicago_stamp(moment: datetime) -> str:
     return moment.astimezone(CHICAGO).strftime("%Y-%m-%d %H:%M %Z")
 
@@ -627,11 +674,19 @@ def execute(config: Config, transport: Transport, sleeper: Sleeper) -> Outcome:
             retry=False,
         )
     base_url = config.base_url
-    url = f"{base_url}{path}"
+    date_range = resolve_kpi_range(config)
+    query = ""
+    if date_range is not None:
+        query = f"?start={date_range[0].isoformat()}&end={date_range[1].isoformat()}"
+    url = f"{base_url}{path}{query}"
     parts = urlsplit(base_url)
-    target = f"{parts.scheme}://{parts.netloc}{path}"
+    target = f"{parts.scheme}://{parts.netloc}{path}{query}"
     secrets = [config.token]
     logs: list[str] = []
+    if date_range is not None:
+        logs.append(
+            f"KPI date range: {date_range[0].isoformat()} through {date_range[1].isoformat()} (America/Chicago business dates)"
+        )
     last_error: Optional[RefreshError] = None
     for attempt in range(1, config.max_attempts + 1):
         delay = backoff_before(attempt, config.backoff)
@@ -712,6 +767,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--kpi-range",
+        default="none",
+        help=(
+            "KPI only: none (app default) or prior-and-current (Monday of the prior "
+            "Chicago week through today). Empty means none."
+        ),
+    )
+    parser.add_argument("--range-start", default="", help="KPI only: explicit start date YYYY-MM-DD.")
+    parser.add_argument("--range-end", default="", help="KPI only: explicit end date YYYY-MM-DD (default today).")
+    parser.add_argument(
         "--test-hooks",
         action="store_true",
         help="Enable test-only clock control. Do not set this in GitHub Actions.",
@@ -774,6 +839,9 @@ def config_from_args(args: argparse.Namespace) -> Config:
         require_chicago_hour=args.require_chicago_hour,
         require_chicago_monday=args.require_chicago_monday,
         now=now,
+        kpi_range=(args.kpi_range or "none").strip() or "none",
+        range_start=args.range_start,
+        range_end=args.range_end,
     )
 
 

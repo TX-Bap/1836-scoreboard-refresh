@@ -33,6 +33,16 @@ on:
         required: false
         default: ""
         type: string
+      range_start:
+        description: "Optional first business date to re-pull (YYYY-MM-DD). Leave empty to use KPI_RANGE_MODE."
+        required: false
+        default: ""
+        type: string
+      range_end:
+        description: "Optional last business date to re-pull (YYYY-MM-DD). Empty means today in America/Chicago."
+        required: false
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -57,6 +67,12 @@ jobs:
           SCOREBOARD_REFRESH_TOKEN: ${{ secrets.SCOREBOARD_REFRESH_TOKEN }}
           KPI_PATH_INPUT: ${{ github.event.inputs.kpi_path }}
           KPI_PATH_VAR: ${{ vars.KPI_REFRESH_PATH }}
+          # Repository variable. Leave unset (or "none") until the app accepts
+          # ?start=&end= on /api/refresh-kpis; then set it to prior-and-current so
+          # every Monday run re-pulls the full prior Mon-Sun week plus this week.
+          KPI_RANGE_VAR: ${{ vars.KPI_RANGE_MODE }}
+          RANGE_START_INPUT: ${{ github.event.inputs.range_start }}
+          RANGE_END_INPUT: ${{ github.event.inputs.range_end }}
         run: |
           set -euo pipefail
           python3 scripts/refresh_call.py \
@@ -70,4 +86,7 @@ jobs:
             --max-attempts 3 \
             --backoff-seconds 10,30 \
             --event "${GITHUB_EVENT_NAME}" \
-            --require-chicago-monday
+            --require-chicago-monday \
+            --kpi-range "${KPI_RANGE_VAR:-none}" \
+            --range-start "${RANGE_START_INPUT:-}" \
+            --range-end "${RANGE_END_INPUT:-}"

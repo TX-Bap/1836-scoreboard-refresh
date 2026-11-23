@@ -119,6 +119,20 @@ Use the same status codes as sales so the scheduler can classify them: HTTP 503 
 
 The scheduler does not follow redirects. A login page or any other HTML document is a failed refresh, including when the status is 200.
 
+## Prior-week re-pull (KPI date range)
+
+By default the KPI request has no date range and the app refreshes its usual recent days. Once the app accepts a range on `POST /api/refresh-kpis`, set the repository variable `KPI_RANGE_MODE` to `prior-and-current`. Every KPI run, scheduled or dispatched, then sends:
+
+```
+POST /api/refresh-kpis?start=<Monday of the prior America/Chicago week>&end=<today in America/Chicago>
+```
+
+On Monday Nov 23, 2026 that is `?start=2026-11-16&end=2026-11-23`. The body stays empty and the response contract above is unchanged. Leave `KPI_RANGE_MODE` unset or `none` until the app change is live.
+
+A manual run can re-pull any span of up to 62 days with the `range_start` and `range_end` inputs (`YYYY-MM-DD`; an empty end means today). Explicit dates win over `KPI_RANGE_MODE`. Invalid dates, an end before the start, an end after today, or a span longer than 62 days fail the run before any request is sent.
+
+Purchases (Zalat Lisanti, La Viva nightly workbook) and guest scores (Ovation) are not pulled by this repo. Box-side pushers send them to the app's token-authenticated `POST /api/ingest-data`.
+
 ## Local validation
 
 ```bash
