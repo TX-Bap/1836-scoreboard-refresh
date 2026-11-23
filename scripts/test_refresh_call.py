@@ -1251,12 +1251,19 @@ class WorkflowContractTests(unittest.TestCase):
         self.assertNotIn("--require-chicago-hour", sales)
         self.assertNotIn("--require-chicago-monday", sales)
         self.assertNotIn("hunger", sales.lower())
+        self.assertIn("actions: write", sales)
+        self.assertIn("refresh-kpis.yml", sales)
+        self.assertIn("10:20", sales)
+        self.assertIn("12:30", sales)
+        self.assertIn("secrets.GITHUB_TOKEN", sales)
+        self.assertIn("dispatch-monday-kpi-backup", sales)
 
         monday_crons = (
             "15 10 * * 1",
             "45 10 * * 1",
             "15 11 * * 1",
             "45 11 * * 1",
+            "15 12 * * 1",
         )
         for cron in monday_crons:
             self.assertIn(f'cron: "{cron}"', kpi)
@@ -1347,10 +1354,14 @@ class WorkflowContractTests(unittest.TestCase):
         import re
 
         crons = re.findall(r'cron:\s*"([^"]+)"', kpi)
-        self.assertEqual(
-            crons,
-            ["15 10 * * 1", "45 10 * * 1", "15 11 * * 1", "45 11 * * 1"],
-        )
+        primary = [
+            "15 10 * * 1",
+            "45 10 * * 1",
+            "15 11 * * 1",
+            "45 11 * * 1",
+        ]
+        backup = "15 12 * * 1"
+        self.assertEqual(crons, primary + [backup])
         seasons = (
             ("CST", datetime(2026, 1, 12, tzinfo=timezone.utc)),
             ("CDT", datetime(2026, 7, 13, tzinfo=timezone.utc)),
@@ -1371,11 +1382,20 @@ class WorkflowContractTests(unittest.TestCase):
                 local = moment.astimezone(refresh_call.CHICAGO)
                 self.assertEqual(local.weekday(), 0, f"{label} {cron} is {local}")
                 minute_of_day = local.hour * 60 + local.minute
+                if cron == backup:
+                    # Last-resort backup: 6:15 a.m. CST / 7:15 a.m. CDT.
+                    expected = 6 * 60 + 15 if label == "CST" else 7 * 60 + 15
+                    self.assertEqual(minute_of_day, expected, f"{label} {cron} is {local}")
+                    continue
                 # 6:45 a.m. leaves the 10-minute job timeout inside the 7:00 deadline.
                 self.assertLessEqual(minute_of_day, 6 * 60 + 45, f"{label} {cron} is {local}")
                 local_minutes.append(minute_of_day)
-            in_window = [item for item in local_minutes if 4 * 60 + 30 <= item <= 6 * 60 + 30]
-            self.assertTrue(in_window, f"{label} has no cron between 4:30 and 6:30 a.m.")
+            in_window = [
+                item for item in local_minutes if 4 * 60 + 30 <= item <= 6 * 60 + 30
+            ]
+            self.assertTrue(
+                in_window, f"{label} has no primary cron between 4:30 and 6:30 a.m."
+            )
 
 
 if __name__ == "__main__":

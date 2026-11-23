@@ -10,6 +10,8 @@ Workflow: `.github/workflows/refresh-scoreboard.yml`
 
 The workflow runs about every 5 minutes (`*/5 * * * *`) and from a manual `workflow_dispatch`. GitHub may start a scheduled run later than the cron time. The concurrency group `scoreboard-sales-refresh` keeps one run active and keeps only the newest waiting run, so refreshes do not overlap.
 
+On Mondays between 10:20 and 12:30 UTC, a second job in this workflow checks whether `refresh-kpis.yml` already has a successful run for the current UTC day. If it does not, and no run is already in progress, it dispatches `refresh-kpis.yml` with `GITHUB_TOKEN`. That window is 4:20-6:30 a.m. Central Standard Time and 5:20-7:30 a.m. Central Daylight Time, so a dropped weekly cron can still be replaced before 7:00 a.m. America/Chicago in either season. The job needs `actions: write` for the dispatch. Duplicate KPI runs are harmless: the endpoint is idempotent, and the `scoreboard-kpi-refresh` concurrency group keeps an in-progress run and does not cancel it.
+
 Each attempt is a `POST` to `/api/refresh-sales` with a 60-second timeout. The bearer token comes from the secret `SCOREBOARD_REFRESH_TOKEN`. A missing secret fails the run with that name in the log and does not print a value.
 
 Success is all of the following:
@@ -41,7 +43,9 @@ Workflow: `.github/workflows/refresh-kpis.yml`
 
 KPIs are weekly. The snapshot must refresh on Monday and be finished before 7:00 a.m. America/Chicago. The workflow also starts from a manual `workflow_dispatch`.
 
-GitHub cron is UTC and does not follow America/Chicago daylight-saving time. Scheduled runs are often delayed and are sometimes dropped, so the workflow registers four Monday UTC times. Each one is Monday morning in both Central Standard Time (UTC-6) and Central Daylight Time (UTC-5). At least one falls between about 4:30 and 6:30 a.m. Chicago in either season. The minutes are 15 and 45 so the runs avoid the start of the hour, when GitHub delays scheduled workflows. The latest on-time start is 6:45 a.m. Chicago, and the job timeout is 10 minutes, so an on-time run finishes before 7:00 a.m.
+GitHub cron is UTC and does not follow America/Chicago daylight-saving time. Scheduled runs are often delayed and are sometimes dropped, so the workflow registers four Monday UTC times plus a later backup. Each of the first four is Monday morning in both Central Standard Time (UTC-6) and Central Daylight Time (UTC-5). At least one falls between about 4:30 and 6:30 a.m. Chicago in either season. The minutes are 15 and 45 so the runs avoid the start of the hour, when GitHub delays scheduled workflows. The latest on-time start among those four is 6:45 a.m. Chicago, and the job timeout is 10 minutes, so an on-time run finishes before 7:00 a.m.
+
+A fifth Monday cron at 12:15 UTC is a last-resort backup if those four scheduled starts are all dropped. That is 6:15 a.m. Central Standard Time and 7:15 a.m. Central Daylight Time. During daylight time it starts after the 7:00 a.m. deadline. The earlier backup is the live-sales workflow, which can dispatch this workflow on Mondays between 10:20 and 12:30 UTC when no successful run exists yet for that UTC day.
 
 | UTC Monday | Central Standard Time (UTC-6) | Central Daylight Time (UTC-5) |
 | --- | --- | --- |
@@ -49,6 +53,7 @@ GitHub cron is UTC and does not follow America/Chicago daylight-saving time. Sch
 | `45 10 * * 1` (10:45 UTC) | 4:45 a.m. | 5:45 a.m. |
 | `15 11 * * 1` (11:15 UTC) | 5:15 a.m. | 6:15 a.m. |
 | `45 11 * * 1` (11:45 UTC) | 5:45 a.m. | 6:45 a.m. |
+| `15 12 * * 1` (12:15 UTC) | 6:15 a.m. (backup) | 7:15 a.m. (backup) |
 
 The scheduled job passes `--require-chicago-monday`. It sends the request when the current America/Chicago time is a Monday, at any hour, so a late start still refreshes. A scheduled run that starts on another weekday does not call the app and exits non-zero, which makes the miss visible. The refresh endpoint is idempotent, so the extra Monday runs are safe. A manual `workflow_dispatch` bypasses the Monday guard and can run on any day. `--require-chicago-hour` remains available and still limits a scheduled run to one America/Chicago hour. This workflow does not pass that flag.
 
